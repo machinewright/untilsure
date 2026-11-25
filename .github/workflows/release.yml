@@ -30,4 +30,6 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes "Binaries for Linux and macOS (amd64, arm64). Or: go install github.com/machinewright/untilsure@${GITHUB_REF_NAME}"
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" \
+            --notes "Binaries for Linux and macOS (amd64, arm64). Or: go install github.com/machinewright/untilsure@${GITHUB_REF_NAME}"
