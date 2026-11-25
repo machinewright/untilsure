@@ -20,6 +20,10 @@ It runs any command: a single test, a test file, a script. A run fails if the co
 go install github.com/machinewright/untilsure@latest
 ```
 
+Or download a binary for Linux or macOS from the [releases](https://github.com/machinewright/untilsure/releases)
+page, unpack it and put `untilsure` on your PATH. On macOS, a downloaded binary isn't notarized: if it's blocked,
+run `xattr -d com.apple.quarantine untilsure` once, or use `go install`.
+
 Linux and macOS. (It builds elsewhere, but only Unix systems let it stop the processes a run leaves behind.)
 Needs Go 1.22 or newer to build; no dependencies outside the standard library.
 

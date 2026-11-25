@@ -37,6 +37,9 @@ Exit status: 0 FIXED, 1 NOT FIXED, 2 UNDECIDED, 3 usage or start error
 Options:
 `
 
+// buildVersion is set by release builds (-ldflags "-X main.buildVersion=..."); go install uses the module version.
+var buildVersion string
+
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
 func run(argv []string, stdout, stderr io.Writer) int {
@@ -63,9 +66,12 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 3
 	}
 	if *version {
-		v := "(devel)"
-		if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" {
+		v := buildVersion
+		if bi, ok := debug.ReadBuildInfo(); v == "" && ok && bi.Main.Version != "" {
 			v = bi.Main.Version
+		}
+		if v == "" {
+			v = "(devel)"
 		}
 		fmt.Fprintln(stdout, "untilsure", v)
 		return 0
