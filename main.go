@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -84,6 +85,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 3
 	}
 
+	if *jobs < 1 {
+		fmt.Fprintln(stderr, "untilsure: -j must be at least 1")
+		return 3
+	}
 	if *measure && *runs < 1 {
 		fmt.Fprintln(stderr, "untilsure: --runs must be at least 1")
 		return 3
@@ -216,8 +221,11 @@ func badStart(res Result, countedSoFar int) error {
 		return fmt.Errorf("could not start the command: %v", res.StartErr)
 	}
 	if countedSoFar == 0 && (res.ExitCode == 126 || res.ExitCode == 127) {
-		return fmt.Errorf("the first run exited with %d, which usually means the command was not found or not executable; not counting it as a flaky failure.\n%s",
-			res.ExitCode, lastLines(res.Output, 5))
+		msg := fmt.Errorf("the first run exited with %d, which usually means the command was not found or not executable; not counting it as a flaky failure", res.ExitCode)
+		if len(bytes.TrimSpace(res.Output)) > 0 {
+			msg = fmt.Errorf("%v.\n%s", msg, lastLines(res.Output, 5))
+		}
+		return msg
 	}
 	return nil
 }
@@ -319,6 +327,9 @@ func verdictText(pl *Plan, v Verdict, n, f int, interrupted bool) string {
 	why := fmt.Sprintf("reached --max %d", pl.Max)
 	if interrupted {
 		why = "interrupted"
+	}
+	if interrupted && n > 0 {
+		return fmt.Sprintf("UNDECIDED (interrupted): %s (%s), not yet enough to decide.", fmt.Sprintf("%d %s in %d %s", f, plural(f, "failure", "failures"), n, plural(n, "run", "runs")), pct(float64(f)/float64(n)))
 	}
 	if n == 0 {
 		return "UNDECIDED (" + why + "): no runs finished."

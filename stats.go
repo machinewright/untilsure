@@ -51,8 +51,8 @@ func NewPlan(p0, better, risk float64, max int) (*Plan, error) {
 	// Refuse plans no one could run: Wald's approximation of the expected
 	// length when fixed is upper/lp-ish; a clean run alone needs upper/lp runs.
 	if clean := pl.upper / pl.lp; clean > 1e5 {
-		return nil, fmt.Errorf("this check would need over %.0f runs (about %.1g clean runs in a row to say FIXED): "+
-			"the old failure rate is too low or --better too close to 1 to test this way", clean, clean)
+		return nil, fmt.Errorf("saying FIXED would take over 100,000 passing runs in a row (about %.0f): "+
+			"the old failure rate is too low, or --better too close to 1, to check this way", clean)
 	}
 	pl.Max = uncapped
 	pl.calibrate()

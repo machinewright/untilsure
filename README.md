@@ -40,8 +40,11 @@ $ untilsure --measure --runs 200 -j 4 -- go test -count=1 -run 'TestRefreshSleep
   To check a fix, a cautious --was is the low end: if --was is above the real old rate,
   a test that is still broken is more likely to be called FIXED.
   untilsure --was 2.0% -j 4 -- go test -count=1 -run 'TestRefreshSleep$' ./example
-Failure logs (first 5 of 9): /tmp/untilsure-1144086051/run-39.log ...
+Failure logs (first 5 of 9): /tmp/untilsure-1144086051/run-39.log /tmp/untilsure-1144086051/run-69.log /tmp/untilsure-1144086051/run-78.log /tmp/untilsure-1144086051/run-110.log /tmp/untilsure-1144086051/run-127.log
 ```
+
+The counts differ from run to run (another measurement here gave 6 failures and `--was 1.1%`); the plan lines
+below depend only on the options.
 
 Why the low end: the guarantee ("a test still failing at the old rate is called FIXED at most 5% of the time")
 holds for any rate at or above `--was`. If `--was` is above the real rate, a test that is still broken sits
@@ -113,8 +116,8 @@ flaky failure.
 
 ## Limits
 
-- Very rare failures can't be checked this way. Below roughly 1 failure in 10,000 runs, FIXED would need more than
-  100,000 clean runs in a row, and `untilsure` says so instead of starting.
+- Very rare failures can't be checked this way. Below roughly 1 failure in 30,000 runs (with the default `--better 10`), FIXED would
+  need more than 100,000 passing runs in a row, and `untilsure` says so instead of starting.
 
 - The statistics assume runs are independent with a steady failure rate. A test that fails only after another
   test has left state behind, or only at certain times of day, breaks that assumption. So does a failure rate
