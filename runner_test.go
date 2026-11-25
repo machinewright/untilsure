@@ -101,3 +101,46 @@ func TestCLIMeasure(t *testing.T) {
 		t.Errorf("exit %d, output %q", code, out)
 	}
 }
+
+// A run that exits 0 but leaves a background process holding its output open
+// is a pass, and must not wait for that process.
+func TestBackgroundProcessIsAPass(t *testing.T) {
+	r := &Runner{Args: []string{"sh", "-c", "sleep 5 & echo started; exit 0"}, Jobs: 1, Limit: 2}
+	start := time.Now()
+	var got []Result
+	r.Run(context.Background(), func(res Result) bool { got = append(got, res); return false })
+	if len(got) != 2 || got[0].Failed || got[1].Failed {
+		t.Errorf("got %+v, want two passes", got)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("took %v; runs waited for their background process", d)
+	}
+}
+
+func TestCLIRejectsBadInput(t *testing.T) {
+	for _, args := range [][]string{
+		{"--measure", "--runs", "0", "--", "true"},
+		{"--was", "5%", "--better", "inf", "--", "true"},
+		{"--was", "1e-7", "--", "true"},
+		{"--was", "5%", "--max", "10", "--", "true"},
+		{"--was", "5%", "--runs", "10", "--", "true"},
+	} {
+		if code, _, e := cli(t, args...); code != 3 {
+			t.Errorf("%v: exit %d (%q), want 3", args, code, e)
+		}
+	}
+	if _, _, e := cli(t, "--was", "5", "--", "true"); !strings.Contains(e, "did you mean 5%") {
+		t.Errorf("--was 5: %q", e)
+	}
+}
+
+func TestRounding(t *testing.T) {
+	for _, c := range []struct {
+		x        float64
+		down, up string
+	}{{0.016501, "1.6%", "1.7%"}, {0.015402, "1.5%", "1.6%"}, {0.25, "25%", "25%"}, {0.00123, "0.12%", "0.13%"}} {
+		if d, u := pctDown(c.x), pctUp(c.x); d != c.down || u != c.up {
+			t.Errorf("%g: down %s up %s, want %s %s", c.x, d, u, c.down, c.up)
+		}
+	}
+}

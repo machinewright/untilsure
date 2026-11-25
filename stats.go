@@ -35,8 +35,8 @@ func NewPlan(p0, better, risk float64, max int) (*Plan, error) {
 	if !(p0 > 0 && p0 < 1) {
 		return nil, fmt.Errorf("--was must be a failure rate between 0 and 1 (got %g)", p0)
 	}
-	if !(better > 1) {
-		return nil, fmt.Errorf("--better must be more than 1 (got %g)", better)
+	if !(better > 1) || math.IsInf(better, 0) {
+		return nil, fmt.Errorf("--better must be a number above 1 (got %g)", better)
 	}
 	if !(risk > 0 && risk < 0.5) {
 		return nil, fmt.Errorf("--risk must be between 0 and 0.5 (got %g)", risk)
@@ -48,6 +48,14 @@ func NewPlan(p0, better, risk float64, max int) (*Plan, error) {
 		upper: math.Log((1 - risk) / risk),
 		lower: math.Log(risk / (1 - risk)),
 	}
+	// Refuse plans no one could run: Wald's approximation of the expected
+	// length when fixed is upper/lp-ish; a clean run alone needs upper/lp runs.
+	if clean := pl.upper / pl.lp; clean > 1e5 {
+		return nil, fmt.Errorf("this check would need over %.0f runs (about %.1g clean runs in a row to say FIXED): "+
+			"the old failure rate is too low or --better too close to 1 to test this way", clean, clean)
+	}
+	pl.Max = uncapped
+	pl.calibrate()
 	if max <= 0 {
 		pl.Max = pl.AutoMax()
 	} else {
@@ -55,6 +63,27 @@ func NewPlan(p0, better, risk float64, max int) (*Plan, error) {
 	}
 	pl.calibrate()
 	return pl, nil
+}
+
+const uncapped = 1 << 30
+
+// MinRunsToFix is the smallest number of runs after which FIXED is possible
+// (all of them passing), or 0 if FIXED can't be reached within Max.
+func (pl *Plan) MinRunsToFix() int {
+	n := int(math.Ceil((pl.upper - 1e-9) / pl.lp))
+	if n < 1 {
+		n = 1
+	}
+	for n > 1 && pl.Decide(n-1, 0) == Fixed {
+		n--
+	}
+	for pl.Decide(n, 0) != Fixed {
+		n++
+	}
+	if n > pl.Max {
+		return 0
+	}
+	return n
 }
 
 // calibrate moves Wald's thresholds outwards, if needed, until the exact
@@ -129,22 +158,23 @@ type OC struct {
 // independently with probability p.
 func (pl *Plan) Exact(p float64) OC {
 	var oc OC
-	alive := map[int]float64{0: 1} // failures -> probability, among runs still going
+	// alive[f-lo] = probability of being undecided with f failures. For a given
+	// number of runs the undecided failure counts form a contiguous range.
+	alive, lo := []float64{1}, 0
 	mass := 1.0
 	for n := 0; n < pl.Max && mass > 1e-14; n++ {
-		mass = 0
-		next := make(map[int]float64, len(alive)+1)
-		for f, pr := range alive {
-			oc.MeanRuns += pr // this run happens
-			for _, step := range [2]struct {
-				df int
-				q  float64
-			}{{0, 1 - p}, {1, p}} {
-				q := pr * step.q
+		oc.MeanRuns += mass
+		next := make([]float64, len(alive)+1) // failures lo .. lo+len(alive)
+		for k, pr := range alive {
+			if pr == 0 {
+				continue
+			}
+			f := lo + k
+			for df, q := range [2]float64{pr * (1 - p), pr * p} {
 				if q == 0 {
 					continue
 				}
-				switch pl.Decide(n+1, f+step.df) {
+				switch pl.Decide(n+1, f+df) {
 				case Fixed:
 					oc.PFixed += q
 				case NotFixed:
@@ -152,12 +182,23 @@ func (pl *Plan) Exact(p float64) OC {
 				case Undecided:
 					oc.PUndecided += q
 				default:
-					next[f+step.df] += q
-					mass += q
+					next[k+df] += q
 				}
 			}
 		}
-		alive = next
+		// trim zeros at both ends
+		a, b := 0, len(next)
+		for a < b && next[a] == 0 {
+			a++
+		}
+		for b > a && next[b-1] == 0 {
+			b--
+		}
+		alive, lo = next[a:b], lo+a
+		mass = 0
+		for _, x := range alive {
+			mass += x
+		}
 	}
 	return oc
 }
@@ -165,8 +206,10 @@ func (pl *Plan) Exact(p float64) OC {
 // AutoMax caps the test at 10x the longer of its expected lengths under the two
 // hypotheses (computed without a cap), rounded up to a multiple of 10.
 func (pl *Plan) AutoMax() int {
-	pl.Max = 1 << 20
+	saved := pl.Max
+	pl.Max = uncapped
 	e := math.Max(pl.Exact(pl.P0).MeanRuns, pl.Exact(pl.P1).MeanRuns)
+	pl.Max = saved
 	return int(math.Ceil(e)*10+9) / 10 * 10
 }
 

@@ -7,12 +7,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -82,8 +84,28 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 3
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	if *measure && *runs < 1 {
+		fmt.Fprintln(stderr, "untilsure: --runs must be at least 1")
+		return 3
+	}
+	if !*measure {
+		bad := ""
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "runs" || f.Name == "for" {
+				bad = f.Name
+			}
+		})
+		if bad != "" {
+			fmt.Fprintf(stderr, "untilsure: --%s only applies with --measure\n", bad)
+			return 3
+		}
+	}
+
+	// Ctrl-C, kill or a closed terminal stop the runs and report what was seen.
+	// A second signal exits at once.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
+	go func() { <-ctx.Done(); stop() }()
 	r := &Runner{Args: args, Jobs: *jobs, Timeout: *timeout}
 	saver := &logSaver{dir: *logs, keep: *keep}
 	prog := newProgress(stderr, *quiet)
@@ -96,7 +118,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}
 		var n, f int
 		var startErr error
-		discarded := r.Run(ctx, func(res Result) bool {
+		r.Run(ctx, func(res Result) bool {
 			if bad := badStart(res, n); bad != nil {
 				startErr = bad
 				return true
@@ -110,7 +132,6 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			return false
 		})
 		prog.clear()
-		_ = discarded
 		if startErr != nil {
 			fmt.Fprintln(stderr, "untilsure:", startErr)
 			return 3
@@ -119,7 +140,14 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "untilsure: no runs finished")
 			return 3
 		}
-		fmt.Fprintln(stdout, measureReport(n, f, rk, args))
+		extra := ""
+		if *jobs != 1 {
+			extra += fmt.Sprintf(" -j %d", *jobs)
+		}
+		if *timeout > 0 {
+			extra += " --timeout " + timeout.String()
+		}
+		fmt.Fprintln(stdout, measureReport(n, f, args, extra))
 		if ctx.Err() != nil {
 			fmt.Fprintln(stdout, "(interrupted)")
 		}
@@ -129,12 +157,19 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	p0, err := parseRate(*was)
 	if err != nil {
+		if v, e := strconv.ParseFloat(strings.TrimSpace(*was), 64); e == nil && v >= 1 && v < 100 {
+			err = fmt.Errorf("%w; did you mean %s%%?", err, strings.TrimSpace(*was))
+		}
 		fmt.Fprintln(stderr, "untilsure: --was:", err)
 		return 3
 	}
 	pl, err := NewPlan(p0, *better, rk, *maxRuns)
 	if err != nil {
 		fmt.Fprintln(stderr, "untilsure:", err)
+		return 3
+	}
+	if pl.MinRunsToFix() == 0 {
+		fmt.Fprintf(stderr, "untilsure: with --max %d this check can never say FIXED; leave out --max, or raise it\n", pl.Max)
 		return 3
 	}
 	fmt.Fprint(stderr, planText(pl))
@@ -221,7 +256,31 @@ func parseRate(s string) (float64, error) {
 	return v, nil
 }
 
+// pctDown and pctUp round to the precision pct shows, down or up, for bounds
+// whose rounding must not make a claim stronger than it is.
+func pctDown(x float64) string { return pct(roundAt(x, math.Floor)) }
+func pctUp(x float64) string   { return pct(roundAt(x, math.Ceil)) }
+
+func roundAt(x float64, r func(float64) float64) float64 {
+	if x <= 0 || x >= 1 {
+		return x
+	}
+	d := 0.0 // digits after the decimal point in percent, as pct prints them
+	switch {
+	case x >= 0.1:
+	case x >= 0.01:
+		d = 1
+	default:
+		d = 1 - math.Floor(math.Log10(100*x)) // two significant digits
+	}
+	k := math.Pow(10, d) * 100
+	return r(x*k) / k
+}
+
 func pct(x float64) string {
+	if x > 0 && x < 1e-6 {
+		return "<0.0001%"
+	}
 	switch {
 	case x == 0:
 		return "0%"
@@ -252,10 +311,10 @@ func verdictText(pl *Plan, v Verdict, n, f int, interrupted bool) string {
 	lo, hi := Interval(f, n, 0.95)
 	switch v {
 	case Fixed:
-		return fmt.Sprintf("FIXED: %s. A test still failing %s of the time gets this verdict %s of the time.\n"+
-			"  From these runs alone, the failure rate is now under %s (95%% confidence).", obs, pct(pl.P0), pct(pl.Exact(pl.P0).PFixed), pct(UpperBound(f, n, 0.95)))
+		return fmt.Sprintf("FIXED: %s. A test still failing %s of the time gets this verdict %s of the time.",
+			obs, pct(pl.P0), pct(pl.Exact(pl.P0).PFixed))
 	case NotFixed:
-		return fmt.Sprintf("NOT FIXED: %s (%s; 95%% interval %s to %s).", obs, pct(float64(f)/float64(n)), pct(lo), pct(hi))
+		return fmt.Sprintf("NOT FIXED: %s (%s).", obs, pct(float64(f)/float64(n)))
 	}
 	why := fmt.Sprintf("reached --max %d", pl.Max)
 	if interrupted {
@@ -264,7 +323,7 @@ func verdictText(pl *Plan, v Verdict, n, f int, interrupted bool) string {
 	if n == 0 {
 		return "UNDECIDED (" + why + "): no runs finished."
 	}
-	s := fmt.Sprintf("UNDECIDED (%s): %s (%s; 95%% interval %s to %s).", why, obs, pct(float64(f)/float64(n)), pct(lo), pct(hi))
+	s := fmt.Sprintf("UNDECIDED (%s): %s (%s).", why, obs, pct(float64(f)/float64(n)))
 	switch {
 	case hi < pl.P0 && lo > pl.P1:
 		s += fmt.Sprintf("\n  It fails less often than before (%s), but not clearly %gx less.", pct(pl.P0), pl.P0/pl.P1)
@@ -276,22 +335,22 @@ func verdictText(pl *Plan, v Verdict, n, f int, interrupted bool) string {
 	return s
 }
 
-func measureReport(n, f int, conf float64, args []string) string {
+func measureReport(n, f int, args []string, extra string) string {
 	obs := fmt.Sprintf("%d %s in %d %s", f, plural(f, "failure", "failures"), n, plural(n, "run", "runs"))
 	if f == 0 {
 		return fmt.Sprintf("%s: the failure rate is at most %s (95%% upper bound).\n"+
 			"  No failures, so there is nothing to check a fix against yet. Try more runs, -j to add load, or --for 10m.",
-			obs, pct(UpperBound(0, n, 0.95)))
+			obs, pctUp(UpperBound(0, n, 0.95)))
 	}
 	lo, hi := Interval(f, n, 0.95)
-	s := fmt.Sprintf("%s: %s (95%% interval %s to %s).", obs, pct(float64(f)/float64(n)), pct(lo), pct(hi))
+	s := fmt.Sprintf("%s: %s (95%% interval %s to %s).", obs, pct(float64(f)/float64(n)), pctDown(lo), pctUp(hi))
 	if f < n {
-		s += fmt.Sprintf("\n  To check a fix, use the low end, so that a still-broken test can't pass as fixed:\n"+
-			"  untilsure --was %s -- %s", pct(lo), strings.Join(quoteArgs(args), " "))
+		s += fmt.Sprintf("\n  To check a fix, a cautious --was is the low end: if --was is above the real old rate,\n"+
+			"  a test that is still broken is more likely to be called FIXED.\n"+
+			"  untilsure --was %s%s -- %s", pctDown(lo), extra, strings.Join(quoteArgs(args), " "))
 	} else {
 		s += "\n  It failed every time: that's a broken test, not a flaky one."
 	}
-	_ = conf
 	return s
 }
 

@@ -24,22 +24,6 @@ type Result struct {
 
 const outputCap = 256 << 10
 
-// tailBuffer keeps the last outputCap bytes written to it.
-type tailBuffer struct {
-	mu  sync.Mutex
-	buf []byte
-}
-
-func (t *tailBuffer) Write(p []byte) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.buf = append(t.buf, p...)
-	if len(t.buf) > outputCap {
-		t.buf = append([]byte(nil), t.buf[len(t.buf)-outputCap:]...)
-	}
-	return len(p), nil
-}
-
 // Runner starts runs of Args on Jobs workers. Results are handed to the
 // caller strictly in start order (run 1, 2, 3, ...), whatever order they
 // finish in: if failures take longer than passes (timeouts, retries), deciding
@@ -86,7 +70,7 @@ func (r *Runner) Run(ctx context.Context, handle func(Result) bool) int {
 					return
 				}
 				res := r.runOnce(ctx, i)
-				if ctx.Err() != nil && !res.TimedOut && res.StartErr == nil && res.ExitCode == -1 {
+				if ctx.Err() != nil {
 					return // killed because we're stopping: not a real result
 				}
 				it := item{res, make(chan struct{})}
@@ -141,6 +125,16 @@ func (r *Runner) Run(ctx context.Context, handle func(Result) bool) int {
 func (r *Runner) runOnce(ctx context.Context, i int) Result {
 	r.running.Add(1)
 	defer r.running.Add(-1)
+	res := Result{Index: i, ExitCode: -1}
+	// Output goes to a file, not a pipe: a run that leaves a background process
+	// holding stdout open (a server, a daemon) must not keep the run "going".
+	out, err := os.CreateTemp("", "untilsure-out-")
+	if err != nil {
+		res.Failed, res.StartErr = true, err
+		return res
+	}
+	defer os.Remove(out.Name())
+	defer out.Close()
 	rctx := ctx
 	if r.Timeout > 0 {
 		var c context.CancelFunc
@@ -149,28 +143,42 @@ func (r *Runner) runOnce(ctx context.Context, i int) Result {
 	}
 	cmd := exec.CommandContext(rctx, r.Args[0], r.Args[1:]...)
 	cmd.Env = append(os.Environ(), "UNTILSURE_RUN="+strconv.Itoa(i))
-	var out tailBuffer
-	cmd.Stdout, cmd.Stderr = &out, &out
+	cmd.Stdout, cmd.Stderr = out, out
 	setProcessGroup(cmd)
-	cmd.WaitDelay = 2 * time.Second
 	start := time.Now()
-	err := cmd.Run()
-	res := Result{Index: i, Dur: time.Since(start), Output: out.buf, ExitCode: 0}
-	if err == nil {
-		return res
+	err = cmd.Run()
+	res.Dur = time.Since(start)
+	killGroup(cmd) // anything the run left behind would make the next run less independent
+	switch {
+	case err == nil:
+		res.ExitCode = 0
+		return res // passes keep no output
+	case cmd.Process == nil:
+		if rctx.Err() == nil {
+			res.StartErr = err
+		}
+	default:
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.Exited() {
+			res.ExitCode = ee.ExitCode()
+		}
 	}
 	res.Failed = true
-	res.ExitCode = -1
-	var ee *exec.ExitError
-	switch {
-	case errors.As(err, &ee) && ee.Exited():
-		res.ExitCode = ee.ExitCode()
-	case cmd.Process == nil:
-		res.StartErr = err
-	}
 	if r.Timeout > 0 && errors.Is(rctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
 		res.TimedOut = true
 		res.ExitCode = -1
 	}
+	res.Output = readTail(out, outputCap)
 	return res
+}
+
+func readTail(f *os.File, n int64) []byte {
+	st, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	off := max(st.Size()-n, 0)
+	b := make([]byte, st.Size()-off)
+	k, _ := f.ReadAt(b, off)
+	return b[:k]
 }
